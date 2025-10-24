@@ -1,0 +1,15 @@
+services:
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      - "8080:8080"     # веб-интерфейс
+      - "50000:50000"   # inbound-агенты (можно убрать, если не нужно)
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=true
+    volumes:
+      - jenkins_home:/var/jenkins_home  # постоянные данные
+
+volumes:
+  jenkins_home:
