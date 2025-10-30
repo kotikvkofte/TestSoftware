@@ -81,15 +81,14 @@ pipeline {
       }
     }
 
-    stage('Start QEMU (OpenBMC)') {
+   stage('Start QEMU (OpenBMC)') {
   steps {
     sh '''
       set -eux
       cd "${QEMU_DIR}"
 
-      # — поиск .mtd с учётом вложенной папки romulus/romulus —
+      # --- поиск .mtd с учётом вложения romulus/romulus ---
       find_rom() {
-        # ищем любой obmc-phosphor-image-romulus*.static.mtd в дереве romulus/
         find romulus -type f -name 'obmc-phosphor-image-romulus*.static.mtd' | head -n1 || true
       }
 
@@ -110,14 +109,14 @@ pipeline {
       fi
       echo "[INFO] Using MTD image: ${ROM}"
 
-      # проверим занятость портов
+      # --- проверим, что хостовые порты свободны (через nc) ---
       for P in ${SSH_PORT} ${HTTPS_PORT}; do
-        if ss -lnt | awk '{print $4}' | grep -q ":$P$"; then
+        if nc -z 127.0.0.1 "$P" >/dev/null 2>&1; then
           echo "[ERROR] Host port $P already in use"; exit 2
         fi
       done
 
-      # запуск qemu — та же команда, что у тебя на VM
+      # --- запуск qemu (точно как у тебя на VM) ---
       qemu-system-arm -m 256 -M romulus-bmc -nographic \
         -drive file="${ROM}",format=raw,if=mtd \
         -net nic -net user,hostfwd=:0.0.0.0:${SSH_PORT}-:22,hostfwd=:0.0.0.0:${HTTPS_PORT}-:443,hostfwd=udp:0.0.0.0:${IPMI_PORT}-:623,hostname=qemu \
@@ -126,27 +125,30 @@ pipeline {
       echo $! > ../qemu.pid
       cd ..
 
-      # ждём SSH до 180с, затем HTTPS до 900с (nc + curl -k)
+      # --- ожидание портов: SSH (до 180с), затем HTTPS (до 900с) ---
       wait_tcp() {
         HOST="$1"; PORT="$2"; TIMEOUT="$3"; SECS=0
         echo "[INFO] waiting tcp ${HOST}:${PORT} up to ${TIMEOUT}s ..."
-        while ! nc -z "$HOST" "$PORT"; do
+        while ! nc -z "$HOST" "$PORT" >/dev/null 2>&1; do
           sleep 3; SECS=$((SECS+3))
-          [ "$SECS" -ge "$TIMEOUT" ] && { echo "[ERROR] Port ${PORT} did not open in time"; return 1; }
+          if [ "$SECS" -ge "$TIMEOUT" ]; then
+            echo "[ERROR] Port ${PORT} did not open in time"; return 1
+          fi
         done
+        return 0
       }
 
-      wait_tcp "${OPENBMC_HOST}" "${SSH_PORT}" 180 || {
+      if ! wait_tcp "${OPENBMC_HOST}" "${SSH_PORT}" 180; then
         echo '----- QEMU LOG TAIL (SSH wait failed) -----'
         tail -n 200 "${QEMU_LOG}" || true
         exit 1
-      }
+      fi
 
       SECS=0; TIMEOUT=900
       echo "[INFO] waiting https://${OPENBMC_HOST}:${HTTPS_PORT} up to ${TIMEOUT}s ..."
       while true; do
-        if nc -z "${OPENBMC_HOST}" "${HTTPS_PORT}"; then
-          if curl -sk --max-time 5 "https://${OPENBMC_HOST}:${HTTPS_PORT}/" >/dev/null; then
+        if nc -z "${OPENBMC_HOST}" "${HTTPS_PORT}" >/dev/null 2>&1; then
+          if curl -sk --max-time 5 "https://${OPENBMC_HOST}:${HTTPS_PORT}/" >/dev/null 2>&1; then
             echo "[INFO] HTTPS is up."
             break
           fi
@@ -165,6 +167,7 @@ pipeline {
     always { archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false }
   }
 }
+
 
     stage('Run pytest (test_hand.py)') {
       steps {
