@@ -82,40 +82,97 @@ pipeline {
     }
 
     stage('Start QEMU (OpenBMC)') {
-      steps {
-        sh '''
-          set -eux
-          cd "${QEMU_DIR}"
+  steps {
+    sh '''
+      set -eux
 
-          if [ ! -f romulus/obmc-phosphor-image-romulus.static.mtd ]; then
-            curl -L -o romulus.zip \
-              "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
-            rm -rf romulus
-            mkdir -p romulus
-            unzip -o romulus.zip -d romulus
+      cd "${QEMU_DIR}"
+
+      # 1) Ищем готовый .mtd (с таймштампом или без). Если нет — скачиваем zip и распаковываем.
+      find_rom() {
+        # сначала — любые timestamp-образы
+        F=$(ls -1 romulus/obmc-phosphor-image-romulus-*.static.mtd 2>/dev/null | head -n1 || true)
+        if [ -z "$F" ]; then
+          # потом — без таймштампа
+          F=$(ls -1 romulus/obmc-phosphor-image-romulus.static.mtd 2>/dev/null | head -n1 || true)
+        fi
+        echo "$F"
+      }
+
+      ROM=$(find_rom || true)
+      if [ -z "${ROM}" ]; then
+        curl -L -o romulus.zip \
+          "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
+        rm -rf romulus
+        mkdir -p romulus
+        unzip -o romulus.zip -d romulus
+        ROM=$(find_rom)
+      fi
+      test -f "${ROM}"
+
+      # 2) Проверим, что порты свободны (если заняты — покажем, что их держит)
+      ss -lntup || true
+      for P in ${SSH_PORT} ${HTTPS_PORT}; do
+        if ss -lnt | awk '{print $4}' | grep -q ":$P$"; then
+          echo "[ERROR] Host port $P already in use"; exit 2
+        fi
+      done
+
+      # 3) Запускаем QEMU абсолютно теми же флагами, как у тебя на VM
+      #    (hostfwd как в твоей команде; UDP 623 для IPMI оставляем)
+      qemu-system-arm -m 256 -M romulus-bmc -nographic \
+        -drive file="${ROM}",format=raw,if=mtd \
+        -net nic -net user,hostfwd=:0.0.0.0:${SSH_PORT}-:22,hostfwd=:0.0.0.0:${HTTPS_PORT}-:443,hostfwd=udp:0.0.0.0:${IPMI_PORT}-:623,hostname=qemu \
+        > "../${QEMU_LOG}" 2>&1 &
+
+      echo $! > ../qemu.pid
+      cd ..
+
+      # 4) Ожидаем: сперва SSH (признак, что bmc загрузился), затем HTTPS дольше.
+      wait_tcp() {
+        HOST="$1"; PORT="$2"; TIMEOUT="$3"; SECS=0
+        echo "[INFO] waiting tcp ${HOST}:${PORT} up to ${TIMEOUT}s ..."
+        while ! nc -z "$HOST" "$PORT"; do
+          sleep 3; SECS=$((SECS+3))
+          if [ "$SECS" -ge "$TIMEOUT" ]; then
+            echo "[ERROR] Port ${PORT} did not open in time"; return 1
           fi
-
-          qemu-system-arm -m 256 -M romulus-bmc -nographic \
-            -drive file=romulus/obmc-phosphor-image-romulus.static.mtd,format=raw,if=mtd \
-            -net nic -net user,hostfwd=:0.0.0.0:${SSH_PORT}-:22,hostfwd=:0.0.0.0:${HTTPS_PORT}-:443,hostfwd=udp:0.0.0.0:${IPMI_PORT}-:623,hostname=qemu \
-            > "../${QEMU_LOG}" 2>&1 &
-
-          echo $! > ../qemu.pid
-          cd ..
-
-          SECS=0; TIMEOUT=300
-          until nc -z ${OPENBMC_HOST} ${HTTPS_PORT}; do
-            sleep 3; SECS=$((SECS+3))
-            if [ $SECS -ge $TIMEOUT ]; then
-              echo "[ERROR] BMC did not come up in time"; exit 1
-            fi
-          done
-        '''
+        done
+        return 0
       }
-      post {
-        always { archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false }
+
+      # SSH до 180с, потом HTTPS до 900с (плюс проверка ответов curl -k)
+      wait_tcp "${OPENBMC_HOST}" "${SSH_PORT}" 180 || {
+        echo '----- QEMU LOG TAIL (SSH wait failed) -----'
+        tail -n 200 "${QEMU_LOG}" || true
+        exit 1
       }
+
+      SECS=0; TIMEOUT=900
+      echo "[INFO] waiting https://${OPENBMC_HOST}:${HTTPS_PORT} up to ${TIMEOUT}s ..."
+      while true; do
+        if nc -z "${OPENBMC_HOST}" "${HTTPS_PORT}"; then
+          if curl -sk --max-time 5 "https://${OPENBMC_HOST}:${HTTPS_PORT}/" >/dev/null; then
+            echo "[INFO] HTTPS is up."
+            break
+          fi
+        fi
+        sleep 3; SECS=$((SECS+3))
+        if [ "$SECS" -ge "$TIMEOUT" ]; then
+          echo "[ERROR] BMC did not come up in time (${TIMEOUT}s)"
+          echo '----- QEMU LOG TAIL (HTTPS wait failed) -----'
+          tail -n 200 "${QEMU_LOG}" || true
+          exit 1
+        fi
+      done
+    '''
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false
     }
+  }
+}
 
     stage('Run pytest (test_hand.py)') {
       steps {
