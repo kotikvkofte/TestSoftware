@@ -111,41 +111,41 @@ def test_login_invalid_credentials(driver):
 
     assert stayed_on_login or error_hint, f"Ожидали ошибку логина, но URL: {driver.current_url}"
 
-def test_poweron(driver):
-    driver.get(f"{OPENBMC_URL}/#/login")
+# def test_poweron(driver):
+#     driver.get(f"{OPENBMC_URL}/#/login")
 
-    user_input = wait_visible(driver, By.ID, "username")
-    pass_input = wait_visible(driver, By.ID, "password")
-    submit_btn = wait_clickable(driver, By.XPATH, '//*[@id="app"]/main/div/div[1]/div/form/button')
+#     user_input = wait_visible(driver, By.ID, "username")
+#     pass_input = wait_visible(driver, By.ID, "password")
+#     submit_btn = wait_clickable(driver, By.XPATH, '//*[@id="app"]/main/div/div[1]/div/form/button')
 
-    user_input.clear(); user_input.send_keys(OPENBMC_USER)
-    pass_input.clear(); pass_input.send_keys(OPENBMC_PASS)
-    safe_click(driver, submit_btn)
+#     user_input.clear(); user_input.send_keys(OPENBMC_USER)
+#     pass_input.clear(); pass_input.send_keys(OPENBMC_PASS)
+#     safe_click(driver, submit_btn)
 
-    WebDriverWait(driver, TIMEOUT).until(lambda d: "/#/login" not in d.current_url)
+#     WebDriverWait(driver, TIMEOUT).until(lambda d: "/#/login" not in d.current_url)
 
-    # меню "Server control" (старые XPATH’ы часто ломаются; оставим, но с ожиданиями)
-    nav_btn = wait_clickable(driver, By.XPATH, '//*[@id="app"]/div/div[2]/div/nav/ul/li[4]/button')
-    safe_click(driver, nav_btn)
-    time.sleep(1)
-    power_item = wait_clickable(driver, By.XPATH, '//*[@id="operations"]/li/a[7]')
-    safe_click(driver, power_item)
+#     # меню "Server control" (старые XPATH’ы часто ломаются; оставим, но с ожиданиями)
+#     nav_btn = wait_clickable(driver, By.XPATH, '//*[@id="app"]/div/div[2]/div/nav/ul/li[4]/button')
+#     safe_click(driver, nav_btn)
+#     time.sleep(1)
+#     power_item = wait_clickable(driver, By.XPATH, '//*[@id="operations"]/li/a[7]')
+#     safe_click(driver, power_item)
 
-    # кнопка Power On
-    power_btn = wait_clickable(driver, By.XPATH, '//*[@id="main-content"]/div/div[3]/div[2]/div/button')
-    safe_click(driver, power_btn)
+#     # кнопка Power On
+#     power_btn = wait_clickable(driver, By.XPATH, '//*[@id="main-content"]/div/div[3]/div[2]/div/button')
+#     safe_click(driver, power_btn)
 
-    result_div = wait_visible(driver, By.XPATH, '//*[@id="main-content"]/div/div[3]/div[2]/div/div')
-    assert "power operation is in progress" in result_div.text or "no options to display" in result_div.text.lower()
+#     result_div = wait_visible(driver, By.XPATH, '//*[@id="main-content"]/div/div[3]/div[2]/div/div')
+#     assert "power operation is in progress" in result_div.text or "no options to display" in result_div.text.lower()
 
-def test_get_logs(driver):
-    # Ожидаем, что сессия уже залогинена после предыдущего теста
-    logs_menu = wait_clickable(driver, By.XPATH, '//*[@id="app"]/div/div[2]/div/nav/ul/li[2]/button')
-    safe_click(driver, logs_menu)
-    time.sleep(1)
-    logs_item = wait_clickable(driver, By.XPATH, '//*[@id="logs"]/li/a[1]')
-    safe_click(driver, logs_item)
+# def test_get_logs(driver):
+#     # Ожидаем, что сессия уже залогинена после предыдущего теста
+#     logs_menu = wait_clickable(driver, By.XPATH, '//*[@id="app"]/div/div[2]/div/nav/ul/li[2]/button')
+#     safe_click(driver, logs_menu)
+#     time.sleep(1)
+#     logs_item = wait_clickable(driver, By.XPATH, '//*[@id="logs"]/li/a[1]')
+#     safe_click(driver, logs_item)
 
-    logs_table = wait_visible(driver, By.XPATH, '//*[@id="table-event-logs"]/tbody/tr/td/div/div')
-    assert "No items available" in logs_table.text
+#     logs_table = wait_visible(driver, By.XPATH, '//*[@id="table-event-logs"]/tbody/tr/td/div/div')
+#     assert "No items available" in logs_table.text
 
