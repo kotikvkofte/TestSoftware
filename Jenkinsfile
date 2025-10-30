@@ -43,39 +43,47 @@ pipeline {
       }
     }
 
-    stage('Provision tools (apt+python)') {
-      steps {
-        sh '''
-          set -eux
-          # Определяем префикс sudo, если есть
-          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
+  stage('Provision tools (apt+python)') {
+    steps {
+      sh '''
+        set -eux
+        # если есть sudo — используем, иначе apt от root
+        if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
 
-          # Базовые утилиты и зависимости
-          $SUDO apt-get update -o Acquire::Retries=5
-          $SUDO apt-get install -y --no-install-recommends \
-              qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
-              python3 python3-pip python3-venv ca-certificates git \
-              xvfb chromium-driver libnss3 libgconf-2-4
+        $SUDO apt-get update -o Acquire::Retries=5
+        # базовые пакеты, БЕЗ libgconf-2-4
+        $SUDO apt-get install -y --no-install-recommends \
+          qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
+          python3 python3-pip python3-venv ca-certificates git
 
-          # Python env для pytest/robot
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip wheel
-          pip install pytest pytest-cov pytest-html
-          # если есть requirements.txt в репо — поставим
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Robot-библиотеки (для API/GUI тестов OpenBMC, по желанию)
-          pip install robotframework robotframework-requests robotframework-sshlibrary robotframework-seleniumlibrary
-
-          # Установим маленький утилитарный нагрузочник hey
-          if ! command -v hey >/dev/null 2>&1; then
-            curl -L -o hey.tar.gz https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64.tar.gz
-            tar -xzf hey.tar.gz hey && chmod +x hey
-            $SUDO mv hey /usr/local/bin/
+        # попытка поставить инструменты для GUI-тестов (в trixie есть chromium и chromium-driver)
+        if ! command -v chromedriver >/dev/null 2>&1; then
+          if $SUDO apt-get install -y --no-install-recommends chromium chromium-driver xvfb libnss3; then
+            echo "[INFO] chromium + chromedriver installed"
+          else
+            echo "[WARN] chromium/chromedriver unavailable on this image; GUI tests will be skipped"
           fi
-        '''
-      }
+        fi
+
+        # Python env
+        python3 -m venv .venv
+        . .venv/bin/activate
+        pip install --upgrade pip wheel
+        pip install pytest pytest-cov pytest-html
+        [ -f requirements.txt ] && pip install -r requirements.txt || true
+
+        # Robot (если будешь гонять API/GUI)
+        pip install robotframework robotframework-requests robotframework-sshlibrary robotframework-seleniumlibrary
+  
+        # hey (нагрузка)
+        if ! command -v hey >/dev/null 2>&1; then
+          curl -L -o hey.tar.gz https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64.tar.gz
+          tar -xzf hey.tar.gz hey && chmod +x hey
+          if [ -w /usr/local/bin ]; then mv hey /usr/local/bin/; else mkdir -p .local/bin && mv hey .local/bin/; fi
+        fi
+      '''
     }
+  } 
 
     stage('Start QEMU + OpenBMC') {
       steps {
