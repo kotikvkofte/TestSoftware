@@ -9,81 +9,72 @@ pipeline {
   }
 
   environment {
+    // Порты QEMU
     SSH_PORT   = '2222'
     HTTPS_PORT = '2443'
     IPMI_PORT  = '2623'
 
     OPENBMC_HOST  = '127.0.0.1'
     OPENBMC_URL   = "https://${OPENBMC_HOST}:${HTTPS_PORT}"
-
     OPENBMC_USER  = 'root'
     OPENBMC_PASS  = '0penBmc'
 
     QEMU_DIR   = '.qemu'
     QEMU_LOG   = 'artifacts/qemu/qemu.log'
     REPORTS    = 'reports'
+    DEBIAN_FRONTEND = 'noninteractive'
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         deleteDir()
-        git branch: 'lab7', url: 'https://github.com/kotikvkofte/TestSoftware.git' // поменяй ветку при необходимости
+        // укажи здесь правильную ветку
+        git branch: 'lab7', url: 'https://github.com/kotikvkofte/TestSoftware.git'
         sh 'mkdir -p ${QEMU_DIR} artifacts/qemu ${REPORTS}'
       }
     }
 
-    stage('Provision tools (apt + Chrome/chromedriver)') {
+    stage('Provision tools (Chrome + matching chromedriver)') {
       steps {
         sh '''
           set -eux
           if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
 
-          # База (без спорных пакетов)
           $SUDO apt-get update -o Acquire::Retries=5
           $SUDO apt-get install -y --no-install-recommends \
             qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
             python3 python3-pip python3-venv ca-certificates git \
             xvfb libnss3
 
-          # === Путь А: Google Chrome + совместимый chromedriver ===
-          set +e
-          HAVE_CHROME=0
+          # Google Chrome
           $SUDO mkdir -p /usr/share/keyrings
           curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | $SUDO gpg --dearmor -o /usr/share/keyrings/google.gpg
           echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google.gpg] https://dl.google.com/linux/chrome/deb/ stable main' | $SUDO tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
           $SUDO apt-get update -o Acquire::Retries=5
-          if $SUDO apt-get install -y --no-install-recommends google-chrome-stable; then
-            HAVE_CHROME=1
-          fi
-          set -e
+          $SUDO apt-get install -y --no-install-recommends google-chrome-stable
 
-          if [ "$HAVE_CHROME" -eq 1 ]; then
-            # определяем major-версию Chrome и тянем подходящий chromedriver
-            CHROME_VER=$(google-chrome --version | awk '{print $3}')
-            MAJOR=${CHROME_VER%%.*}
-            LATEST_URL="https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${MAJOR}"
-            CHDRV_VER=$(curl -fsSL "$LATEST_URL")
-            curl -fsSL "https://chromedriver.storage.googleapis.com/${CHDRV_VER}/chromedriver_linux64.zip" -o /tmp/chromedriver.zip
-            $SUDO unzip -o /tmp/chromedriver.zip -d /usr/local/bin
-            $SUDO chmod +x /usr/local/bin/chromedriver
-            export CHROME_BIN="/usr/bin/google-chrome"
+          # Подбор chromedriver по Chrome for Testing (новый источник)
+          CHROME_VER=$(google-chrome --version | awk '{print $3}')
+          MAJOR=${CHROME_VER%%.*}
+          # Берём known-good-versions JSON и ищем последнюю 142.x (или текущий major)
+          KGV_URL="https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+          CFT_VER=$(curl -fsSL "$KGV_URL" | jq -r --arg M "$MAJOR." '.versions[] | select(.version|startswith($M)) | .version' | sort -V | tail -1)
+
+          # Скачиваем chromedriver для Linux x64
+          CFT_ZIP="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VER}/linux64/chromedriver-linux64.zip"
+          curl -fsSL "$CFT_ZIP" -o /tmp/chromedriver.zip
+          $SUDO unzip -o /tmp/chromedriver.zip -d /tmp
+          # кладём туда, где ждёт твой тест
+          if [ -x /tmp/chromedriver-linux64/chromedriver ]; then
+            $SUDO mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver
+            $SUDO chmod +x /usr/bin/chromedriver
           else
-            echo "[WARN] Google Chrome repo install failed, fallback to Debian chromium"
-            # === Путь B: Debian chromium + chromium-driver (с ретраями) ===
-            set +e
-            $SUDO apt-get update -o Acquire::Retries=5
-            $SUDO apt-get install -y --no-install-recommends chromium chromium-driver
-            RC=$?
-            set -e
-            if [ "$RC" -ne 0 ]; then
-              echo "[ERROR] Не удалось установить ни google-chrome, ни chromium. Прерываю."
-              exit 100
-            fi
-            export CHROME_BIN="/usr/bin/chromium"
+            echo "[ERROR] chromedriver not found in archive"; exit 22
           fi
 
-          # Python env + pytest
+          # Python env + pytest + selenium
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip wheel
@@ -134,26 +125,17 @@ pipeline {
           set -eux
           . .venv/bin/activate
 
-          # Виртуальный дисплей для не-headless браузера
+          # виртуальный дисплей для не-headless браузера
           Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
           export DISPLAY=:99
 
-          # переменные, которые читает твой тест
           export OPENBMC_URL="${OPENBMC_URL}"
           export OPENBMC_USER="${OPENBMC_USER}"
           export OPENBMC_PASS="${OPENBMC_PASS}"
 
-          # подскажем пути браузеру/драйверу так, как ждёт твой код
-          if command -v google-chrome >/dev/null 2>&1; then
-            export CHROME_BIN="/usr/bin/google-chrome"
-          else
-            export CHROME_BIN="/usr/bin/chromium"
-          fi
-          if [ -x /usr/local/bin/chromedriver ]; then
-            export CHROMEDRIVER_PATH="/usr/local/bin/chromedriver"
-          else
-            export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
-          fi
+          # пути так, как ожидает твой тест
+          export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
+          export CHROME_BIN="/usr/bin/google-chrome"
 
           pytest -q tests/test_hand.py \
             --html="${REPORTS}/pytest.html" --self-contained-html \
