@@ -170,46 +170,56 @@ pipeline {
 
 
     stage('Run pytest (test_hand.py)') {
-      steps {
-        sh '''
-          set -eux
-          . .venv/bin/activate
+  steps {
+    sh '''
+      set -eux
+      . .venv/bin/activate
 
-          # виртуальный дисплей для не-headless браузера
-          Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
-          export DISPLAY=:99
+      # 1) виртуальный дисплей для не-headless chromium/chrome
+      Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
+      export DISPLAY=:99
+      sleep 1
 
-          export OPENBMC_URL="${OPENBMC_URL}"
-          export OPENBMC_USER="${OPENBMC_USER}"
-          export OPENBMC_PASS="${OPENBMC_PASS}"
+      # 2) переменные, которые читает твой тест
+      export OPENBMC_URL="${OPENBMC_URL}"
+      export OPENBMC_USER="${OPENBMC_USER}"
+      export OPENBMC_PASS="${OPENBMC_PASS}"
+      export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
+      # если поставился chrome — используем его, иначе chromium
+      if command -v google-chrome >/dev/null 2>&1; then
+        export CHROME_BIN="/usr/bin/google-chrome"
+      else
+        export CHROME_BIN="/usr/bin/chromium"
+      fi
 
-          # пути так, как ожидает твой тест
-          export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
-          export CHROME_BIN="/usr/bin/google-chrome"
+      # 3) найдём test_hand.py в репозитории
+      TEST_FILE=""
+      # сначала — индекс git (быстро и надёжно)
+      TEST_FILE=$(git ls-files 'test_hand.py' 'tests/test_hand.py' | head -n1 || true)
+      # если не нашли — обойдём файловую систему (на 2 уровня глубины)
+      if [ -z "$TEST_FILE" ]; then
+        TEST_FILE=$(find . -maxdepth 3 -type f -name 'test_hand.py' | head -n1 || true)
+      fi
 
-          pytest -q tests/test_hand.py \
-            --html="${REPORTS}/pytest.html" --self-contained-html \
-            --junitxml="${REPORTS}/junit.xml"
-        '''
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: '${REPORTS}/junit.xml'
-          archiveArtifacts artifacts: '${REPORTS}/**', onlyIfSuccessful: false
-        }
-      }
-    }
+      if [ -z "$TEST_FILE" ]; then
+        echo "[ERROR] Не найден файл test_hand.py в репозитории."
+        echo "[HINT ] Положи его в корень или в каталог tests/, либо поправь Jenkinsfile."
+        exit 2
+        # (если хочешь авто-дискавер всех тестов, замени блок выше на:)
+        # pytest -q --html="${REPORTS}/pytest.html" --self-contained-html --junitxml="${REPORTS}/junit.xml"
+      fi
+
+      echo "[INFO] Running pytest on: $TEST_FILE"
+      pytest -q "$TEST_FILE" \
+        --html="${REPORTS}/pytest.html" --self-contained-html \
+        --junitxml="${REPORTS}/junit.xml"
+    '''
   }
-
   post {
     always {
-      script {
-        sh '''
-          set +e
-          if [ -f qemu.pid ]; then kill -9 "$(cat qemu.pid)" || true; fi
-          pkill -f qemu-system-arm || true
-        '''
-      }
+      junit allowEmptyResults: true, testResults: '${REPORTS}/junit.xml'
+      archiveArtifacts artifacts: '${REPORTS}/**', onlyIfSuccessful: false
     }
   }
+}
 }
