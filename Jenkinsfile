@@ -15,20 +15,16 @@ pipeline {
     IPMI_PORT  = '2623'
 
     OPENBMC_HOST  = '127.0.0.1'
-    OPENBMC_HTTPS = "https://${OPENBMC_HOST}:${HTTPS_PORT}"
+    OPENBMC_URL   = "https://${OPENBMC_HOST}:${HTTPS_PORT}"
 
-    // Каталоги артефактов/отчётов
-    ART_ROOT  = 'artifacts'
-    QEMU_LOG  = 'artifacts/qemu/qemu.log'
-    ROBOT_OUT = 'artifacts/robot'
-    WEBUI_OUT = 'artifacts/webui'
-    LOAD_OUT  = 'artifacts/load'
-    PYREPORTS = 'reports' // для pytest
-  }
+    // Дефолтные креды OpenBMC (как в твоём тесте)
+    OPENBMC_USER  = 'root'
+    OPENBMC_PASS  = '0penBmc'
 
-  triggers {
-    // убери, если используешь webhook
-    pollSCM('H/10 * * * *')
+    // Пути/каталоги
+    QEMU_DIR   = '.qemu'
+    QEMU_LOG   = 'artifacts/qemu/qemu.log'
+    REPORTS    = 'reports'
   }
 
   stages {
@@ -36,62 +32,42 @@ pipeline {
     stage('Checkout') {
       steps {
         deleteDir()
-        git branch: 'lab7',
-            url: 'https://github.com/kotikvkofte/TestSoftware.git'
+        git branch: 'lab7', url: 'https://github.com/kotikvkofte/TestSoftware.git' // укажи нужную ветку
+        sh 'mkdir -p ${QEMU_DIR} artifacts/qemu ${REPORTS}'
         sh 'git rev-parse --short HEAD || true'
-        sh 'mkdir -p artifacts/qemu artifacts/robot artifacts/webui artifacts/load reports .qemu'
       }
     }
 
-  stage('Provision tools (apt+python)') {
-    steps {
-      sh '''
-        set -eux
-        # если есть sudo — используем, иначе apt от root
-        if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
-
-        $SUDO apt-get update -o Acquire::Retries=5
-        # базовые пакеты, БЕЗ libgconf-2-4
-        $SUDO apt-get install -y --no-install-recommends \
-          qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
-          python3 python3-pip python3-venv ca-certificates git
-
-        # попытка поставить инструменты для GUI-тестов (в trixie есть chromium и chromium-driver)
-        if ! command -v chromedriver >/dev/null 2>&1; then
-          if $SUDO apt-get install -y --no-install-recommends chromium chromium-driver xvfb libnss3; then
-            echo "[INFO] chromium + chromedriver installed"
-          else
-            echo "[WARN] chromium/chromedriver unavailable on this image; GUI tests will be skipped"
-          fi
-        fi
-
-        # Python env
-        python3 -m venv .venv
-        . .venv/bin/activate
-        pip install --upgrade pip wheel
-        pip install pytest pytest-cov pytest-html
-        [ -f requirements.txt ] && pip install -r requirements.txt || true
-
-        # Robot (если будешь гонять API/GUI)
-        pip install robotframework robotframework-requests robotframework-sshlibrary robotframework-seleniumlibrary
-  
-        # hey (нагрузка)
-        if ! command -v hey >/dev/null 2>&1; then
-          curl -L -o hey.tar.gz https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64.tar.gz
-          tar -xzf hey.tar.gz hey && chmod +x hey
-          if [ -w /usr/local/bin ]; then mv hey /usr/local/bin/; else mkdir -p .local/bin && mv hey .local/bin/; fi
-        fi
-      '''
-    }
-  } 
-
-    stage('Start QEMU + OpenBMC') {
+    stage('Provision tools') {
       steps {
         sh '''
           set -eux
-          cd .qemu
+          # root или sudo (если Jenkins не под root)
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
 
-          # Скачиваем ROMULUS образ (zip) и распаковываем при первом запуске
+          $SUDO apt-get update -o Acquire::Retries=5
+          # базовое: QEMU, Python, Selenium-стек для Chromium (в Debian trixie пакеты chromium/chromium-driver)
+          $SUDO apt-get install -y --no-install-recommends \
+            qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
+            python3 python3-pip python3-venv ca-certificates git \
+            chromium chromium-driver xvfb libnss3
+
+          # питоновское окружение для pytest
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip wheel
+          pip install pytest pytest-html
+        '''
+      }
+    }
+
+    stage('Start QEMU (OpenBMC)') {
+      steps {
+        sh '''
+          set -eux
+          cd "${QEMU_DIR}"
+
+          # Скачиваем ROMULUS образ (zip) один раз
           if [ ! -f romulus/obmc-phosphor-image-romulus.static.mtd ]; then
             curl -L -o romulus.zip \
               "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
@@ -99,9 +75,6 @@ pipeline {
             mkdir -p romulus
             unzip -o romulus.zip -d romulus
           fi
-
-          # Проверим наличие qemu
-          command -v qemu-system-arm
 
           # Стартуем QEMU в фоне, лог — в artifacts/qemu/qemu.log
           qemu-system-arm -m 256 -M romulus-bmc -nographic \
@@ -112,7 +85,7 @@ pipeline {
           echo $! > ../qemu.pid
           cd ..
 
-          # Ждём пока BMC поднимет HTTPS-порт
+          # Ждём готовности HTTPS (порт 2443 по умолчанию)
           SECS=0; TIMEOUT=300
           until nc -z ${OPENBMC_HOST} ${HTTPS_PORT}; do
             sleep 3; SECS=$((SECS+3))
@@ -129,100 +102,36 @@ pipeline {
       }
     }
 
-    stage('Pytest (tests from repo)') {
+    stage('Run pytest (test_hand.py)') {
       steps {
         sh '''
           set -eux
           . .venv/bin/activate
-          mkdir -p ${PYREPORTS}
-          # Запуск pytest: JUnit + coverage + HTML-отчёт
-          pytest -q --maxfail=1 --disable-warnings \
-            --junitxml=${PYREPORTS}/junit.xml \
-            --cov=. --cov-report=xml:${PYREPORTS}/coverage.xml --cov-report=term-missing \
-            --html=${PYREPORTS}/pytest.html --self-contained-html
+
+          # Запустим виртуальный экран для НЕ headless-хрома в твоём тесте
+          Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
+          export DISPLAY=:99
+
+          # Переменные для твоего теста
+          export OPENBMC_URL="${OPENBMC_URL}"
+          export OPENBMC_USER="${OPENBMC_USER}"
+          export OPENBMC_PASS="${OPENBMC_PASS}"
+
+          # На всякий: явно подскажем путь к chromedriver
+          export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
+          # Если вдруг в тесте понадобится бинарь chromium под именем google-chrome:
+          export CHROME_BIN="/usr/bin/chromium"
+
+          # Прогоним только нужный файл и положим простой HTML-отчёт
+          pytest -q tests/test_hand.py \
+            --html="${REPORTS}/pytest.html" --self-contained-html \
+            --junitxml="${REPORTS}/junit.xml"
         '''
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: '${PYREPORTS}/junit.xml'
-          archiveArtifacts artifacts: '${PYREPORTS}/**', onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('Robot API tests (optional)') {
-      when { expression { return true } } // поменяй на false, если не нужно
-      steps {
-        sh '''
-          set -eux
-          . .venv/bin/activate
-          if [ ! -d openbmc-test-automation ]; then
-            git clone --depth=1 https://github.com/openbmc/openbmc-test-automation.git
-          fi
-          cd openbmc-test-automation
-          robot -v OPENBMC_HOST:${OPENBMC_HOST} -v OPENBMC_PORT:${HTTPS_PORT} \
-                --outputdir "../${ROBOT_OUT}" redfish ipmi || true
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${ROBOT_OUT}/**", onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('Robot WebUI tests (optional)') {
-      when { expression { return true } } // поменяй на false, если не нужно
-      steps {
-        sh '''
-          set -eux
-          . .venv/bin/activate
-          cd openbmc-test-automation
-          export ROBOT_SYSLOG_FILE="../${WEBUI_OUT}/robot_syslog.txt"
-          robot -v OPENBMC_HOST:${OPENBMC_HOST} -v OPENBMC_PORT:${HTTPS_PORT} \
-                -v VERIFY_TLS:false \
-                --outputdir "../${WEBUI_OUT}" gui || true
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${WEBUI_OUT}/**", onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('Load testing (hey)') {
-      steps {
-        sh '''
-          set -eux
-          hey -z 30s -c 25 -m GET "${OPENBMC_HTTPS}/" > "${LOAD_OUT}/hey.txt" 2>&1 || true
-          grep -E 'Requests/sec|Latency' "${LOAD_OUT}/hey.txt" | sed 's/  */ /g' > "${LOAD_OUT}/summary.txt" || true
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${LOAD_OUT}/**", onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('Collect evidence (obmcutil & ipmitool)') {
-      steps {
-        sh '''
-          set -eux
-          # 1) obmcutil state — на самом BMC (ssh: root / 0penBmc)
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -p "${SSH_PORT}" root@${OPENBMC_HOST} 'obmcutil state' \
-              | tee artifacts/qemu/obmcutil_state.txt || true
-
-          # 2) FRU через IPMI с хоста
-          ipmitool -I lanplus -H ${OPENBMC_HOST} -p ${IPMI_PORT} -U root -P 0penBmc fru print \
-              | tee artifacts/qemu/ipmi_fru_print.txt || true
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'artifacts/qemu/obmcutil_state.txt,artifacts/qemu/ipmi_fru_print.txt', onlyIfSuccessful: false
+          junit allowEmptyResults: true, testResults: '${REPORTS}/junit.xml'
+          archiveArtifacts artifacts: '${REPORTS}/**', onlyIfSuccessful: false
         }
       }
     }
@@ -233,6 +142,7 @@ pipeline {
       script {
         sh '''
           set +e
+          # Остановим QEMU
           if [ -f qemu.pid ]; then kill -9 "$(cat qemu.pid)" || true; fi
           pkill -f qemu-system-arm || true
         '''
