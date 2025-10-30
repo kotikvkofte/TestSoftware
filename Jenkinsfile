@@ -5,6 +5,7 @@ pipeline {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '20'))
     disableConcurrentBuilds()
+    skipDefaultCheckout(true)
   }
 
   environment {
@@ -34,11 +35,11 @@ pipeline {
 
     stage('Checkout') {
       steps {
-        checkout scm
-        sh '''
-          set -eux
-          mkdir -p artifacts/qemu artifacts/robot artifacts/webui artifacts/load reports .qemu
-        '''
+        deleteDir()
+        git branch: 'lab7',
+            url: 'https://github.com/kotikvkofte/TestSoftware.git'
+        sh 'git rev-parse --short HEAD || true'
+        sh 'mkdir -p artifacts/qemu artifacts/robot artifacts/webui artifacts/load reports .qemu'
       }
     }
 

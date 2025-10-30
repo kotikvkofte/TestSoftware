@@ -1,5 +1,6 @@
 services:
   jenkins:
+    user: root
     image: jenkins/jenkins:lts-jdk17
     container_name: jenkins
     restart: unless-stopped
