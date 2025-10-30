@@ -37,49 +37,47 @@ pipeline {
     }
 
     stage('Provision tools (Chrome + matching chromedriver)') {
-      steps {
-        sh '''
-          set -eux
-          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
+  steps {
+    sh '''
+      set -eux
+      if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
 
-          $SUDO apt-get update -o Acquire::Retries=5
-          $SUDO apt-get install -y --no-install-recommends \
-            qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
-            python3 python3-pip python3-venv ca-certificates git \
-            xvfb libnss3
+      export DEBIAN_FRONTEND=noninteractive
 
-          # Google Chrome
-          $SUDO mkdir -p /usr/share/keyrings
-          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | $SUDO gpg --dearmor -o /usr/share/keyrings/google.gpg
-          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google.gpg] https://dl.google.com/linux/chrome/deb/ stable main' | $SUDO tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
-          $SUDO apt-get update -o Acquire::Retries=5
-          $SUDO apt-get install -y --no-install-recommends google-chrome-stable
+      $SUDO apt-get update -o Acquire::Retries=5
+      $SUDO apt-get install -y --no-install-recommends \
+        qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
+        python3 python3-pip python3-venv ca-certificates git \
+        xvfb libnss3 gpg
 
-          # Подбор chromedriver по Chrome for Testing (новый источник)
-          CHROME_VER=$(google-chrome --version | awk '{print $3}')
-          MAJOR=${CHROME_VER%%.*}
-          # Берём known-good-versions JSON и ищем последнюю 142.x (или текущий major)
-          KGV_URL="https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
-          CFT_VER=$(curl -fsSL "$KGV_URL" | jq -r --arg M "$MAJOR." '.versions[] | select(.version|startswith($M)) | .version' | sort -V | tail -1)
+      # ==== Google Chrome repo (без TTY, без pipe в gpg) ====
+      $SUDO mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+      curl -fsSL https://dl.google.com/linux/linux_signing_key.pub -o /tmp/google.pub
+      $SUDO gpg --dearmor --yes --batch -o /usr/share/keyrings/google.gpg /tmp/google.pub
+      echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google.gpg] https://dl.google.com/linux/chrome/deb/ stable main' | $SUDO tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
 
-          # Скачиваем chromedriver для Linux x64
-          CFT_ZIP="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VER}/linux64/chromedriver-linux64.zip"
-          curl -fsSL "$CFT_ZIP" -o /tmp/chromedriver.zip
-          $SUDO unzip -o /tmp/chromedriver.zip -d /tmp
-          # кладём туда, где ждёт твой тест
-          if [ -x /tmp/chromedriver-linux64/chromedriver ]; then
-            $SUDO mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver
-            $SUDO chmod +x /usr/bin/chromedriver
-          else
-            echo "[ERROR] chromedriver not found in archive"; exit 22
-          fi
+      $SUDO apt-get update -o Acquire::Retries=5
+      $SUDO apt-get install -y --no-install-recommends google-chrome-stable
 
-          # Python env + pytest + selenium
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip wheel
-          pip install pytest pytest-html selenium
-        '''
+      # ==== Подбор совместимого chromedriver через Chrome for Testing ====
+      CHROME_VER=$(google-chrome --version | awk '{print $3}')
+      MAJOR=${CHROME_VER%%.*}
+      KGV_URL="https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+      CFT_VER=$(curl -fsSL "$KGV_URL" | jq -r --arg M "$MAJOR." '.versions[] | select(.version|startswith($M)) | .version' | sort -V | tail -1)
+
+      CFT_ZIP="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VER}/linux64/chromedriver-linux64.zip"
+      curl -fsSL "$CFT_ZIP" -o /tmp/chromedriver.zip
+      $SUDO unzip -o /tmp/chromedriver.zip -d /tmp
+      test -x /tmp/chromedriver-linux64/chromedriver
+      $SUDO mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver
+      $SUDO chmod +x /usr/bin/chromedriver
+
+      # Python env + pytest + selenium
+      python3 -m venv .venv
+      . .venv/bin/activate
+      pip install --upgrade pip wheel
+      pip install pytest pytest-html selenium
+      '''
       }
     }
 
