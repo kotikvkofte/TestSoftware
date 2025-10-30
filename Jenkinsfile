@@ -9,7 +9,6 @@ pipeline {
   }
 
   environment {
-    // Порты проброса QEMU→хост
     SSH_PORT   = '2222'
     HTTPS_PORT = '2443'
     IPMI_PORT  = '2623'
@@ -17,46 +16,78 @@ pipeline {
     OPENBMC_HOST  = '127.0.0.1'
     OPENBMC_URL   = "https://${OPENBMC_HOST}:${HTTPS_PORT}"
 
-    // Дефолтные креды OpenBMC (как в твоём тесте)
     OPENBMC_USER  = 'root'
     OPENBMC_PASS  = '0penBmc'
 
-    // Пути/каталоги
     QEMU_DIR   = '.qemu'
     QEMU_LOG   = 'artifacts/qemu/qemu.log'
     REPORTS    = 'reports'
   }
 
   stages {
-
     stage('Checkout') {
       steps {
         deleteDir()
-        git branch: 'lab7', url: 'https://github.com/kotikvkofte/TestSoftware.git' // укажи нужную ветку
+        git branch: 'lab7', url: 'https://github.com/kotikvkofte/TestSoftware.git' // поменяй ветку при необходимости
         sh 'mkdir -p ${QEMU_DIR} artifacts/qemu ${REPORTS}'
-        sh 'git rev-parse --short HEAD || true'
       }
     }
 
-    stage('Provision tools') {
+    stage('Provision tools (apt + Chrome/chromedriver)') {
       steps {
         sh '''
           set -eux
-          # root или sudo (если Jenkins не под root)
           if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
 
+          # База (без спорных пакетов)
           $SUDO apt-get update -o Acquire::Retries=5
-          # базовое: QEMU, Python, Selenium-стек для Chromium (в Debian trixie пакеты chromium/chromium-driver)
           $SUDO apt-get install -y --no-install-recommends \
             qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
             python3 python3-pip python3-venv ca-certificates git \
-            chromium chromium-driver xvfb libnss3
+            xvfb libnss3
 
-          # питоновское окружение для pytest
+          # === Путь А: Google Chrome + совместимый chromedriver ===
+          set +e
+          HAVE_CHROME=0
+          $SUDO mkdir -p /usr/share/keyrings
+          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | $SUDO gpg --dearmor -o /usr/share/keyrings/google.gpg
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google.gpg] https://dl.google.com/linux/chrome/deb/ stable main' | $SUDO tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+          $SUDO apt-get update -o Acquire::Retries=5
+          if $SUDO apt-get install -y --no-install-recommends google-chrome-stable; then
+            HAVE_CHROME=1
+          fi
+          set -e
+
+          if [ "$HAVE_CHROME" -eq 1 ]; then
+            # определяем major-версию Chrome и тянем подходящий chromedriver
+            CHROME_VER=$(google-chrome --version | awk '{print $3}')
+            MAJOR=${CHROME_VER%%.*}
+            LATEST_URL="https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${MAJOR}"
+            CHDRV_VER=$(curl -fsSL "$LATEST_URL")
+            curl -fsSL "https://chromedriver.storage.googleapis.com/${CHDRV_VER}/chromedriver_linux64.zip" -o /tmp/chromedriver.zip
+            $SUDO unzip -o /tmp/chromedriver.zip -d /usr/local/bin
+            $SUDO chmod +x /usr/local/bin/chromedriver
+            export CHROME_BIN="/usr/bin/google-chrome"
+          else
+            echo "[WARN] Google Chrome repo install failed, fallback to Debian chromium"
+            # === Путь B: Debian chromium + chromium-driver (с ретраями) ===
+            set +e
+            $SUDO apt-get update -o Acquire::Retries=5
+            $SUDO apt-get install -y --no-install-recommends chromium chromium-driver
+            RC=$?
+            set -e
+            if [ "$RC" -ne 0 ]; then
+              echo "[ERROR] Не удалось установить ни google-chrome, ни chromium. Прерываю."
+              exit 100
+            fi
+            export CHROME_BIN="/usr/bin/chromium"
+          fi
+
+          # Python env + pytest
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip wheel
-          pip install pytest pytest-html
+          pip install pytest pytest-html selenium
         '''
       }
     }
@@ -67,7 +98,6 @@ pipeline {
           set -eux
           cd "${QEMU_DIR}"
 
-          # Скачиваем ROMULUS образ (zip) один раз
           if [ ! -f romulus/obmc-phosphor-image-romulus.static.mtd ]; then
             curl -L -o romulus.zip \
               "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
@@ -76,7 +106,6 @@ pipeline {
             unzip -o romulus.zip -d romulus
           fi
 
-          # Стартуем QEMU в фоне, лог — в artifacts/qemu/qemu.log
           qemu-system-arm -m 256 -M romulus-bmc -nographic \
             -drive file=romulus/obmc-phosphor-image-romulus.static.mtd,format=raw,if=mtd \
             -net nic -net user,hostfwd=:0.0.0.0:${SSH_PORT}-:22,hostfwd=:0.0.0.0:${HTTPS_PORT}-:443,hostfwd=udp:0.0.0.0:${IPMI_PORT}-:623,hostname=qemu \
@@ -85,7 +114,6 @@ pipeline {
           echo $! > ../qemu.pid
           cd ..
 
-          # Ждём готовности HTTPS (порт 2443 по умолчанию)
           SECS=0; TIMEOUT=300
           until nc -z ${OPENBMC_HOST} ${HTTPS_PORT}; do
             sleep 3; SECS=$((SECS+3))
@@ -96,9 +124,7 @@ pipeline {
         '''
       }
       post {
-        always {
-          archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false
-        }
+        always { archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false }
       }
     }
 
@@ -108,21 +134,27 @@ pipeline {
           set -eux
           . .venv/bin/activate
 
-          # Запустим виртуальный экран для НЕ headless-хрома в твоём тесте
+          # Виртуальный дисплей для не-headless браузера
           Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
           export DISPLAY=:99
 
-          # Переменные для твоего теста
+          # переменные, которые читает твой тест
           export OPENBMC_URL="${OPENBMC_URL}"
           export OPENBMC_USER="${OPENBMC_USER}"
           export OPENBMC_PASS="${OPENBMC_PASS}"
 
-          # На всякий: явно подскажем путь к chromedriver
-          export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
-          # Если вдруг в тесте понадобится бинарь chromium под именем google-chrome:
-          export CHROME_BIN="/usr/bin/chromium"
+          # подскажем пути браузеру/драйверу так, как ждёт твой код
+          if command -v google-chrome >/dev/null 2>&1; then
+            export CHROME_BIN="/usr/bin/google-chrome"
+          else
+            export CHROME_BIN="/usr/bin/chromium"
+          fi
+          if [ -x /usr/local/bin/chromedriver ]; then
+            export CHROMEDRIVER_PATH="/usr/local/bin/chromedriver"
+          else
+            export CHROMEDRIVER_PATH="/usr/bin/chromedriver"
+          fi
 
-          # Прогоним только нужный файл и положим простой HTML-отчёт
           pytest -q tests/test_hand.py \
             --html="${REPORTS}/pytest.html" --self-contained-html \
             --junitxml="${REPORTS}/junit.xml"
@@ -142,7 +174,6 @@ pipeline {
       script {
         sh '''
           set +e
-          # Остановим QEMU
           if [ -f qemu.pid ]; then kill -9 "$(cat qemu.pid)" || true; fi
           pkill -f qemu-system-arm || true
         '''
