@@ -208,10 +208,11 @@ pipeline {
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: '${REPORTS}/junit.xml'
-          archiveArtifacts artifacts: '${REPORTS}/**', onlyIfSuccessful: false
+          junit allowEmptyResults: true, testResults: "${REPORTS}/junit.xml"
+          archiveArtifacts artifacts: "${REPORTS}/**", onlyIfSuccessful: false
         }
       }
+
     }
 
   }
