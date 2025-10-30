@@ -85,41 +85,39 @@ pipeline {
   steps {
     sh '''
       set -eux
-
       cd "${QEMU_DIR}"
 
-      # 1) Ищем готовый .mtd (с таймштампом или без). Если нет — скачиваем zip и распаковываем.
+      # — поиск .mtd с учётом вложенной папки romulus/romulus —
       find_rom() {
-        # сначала — любые timestamp-образы
-        F=$(ls -1 romulus/obmc-phosphor-image-romulus-*.static.mtd 2>/dev/null | head -n1 || true)
-        if [ -z "$F" ]; then
-          # потом — без таймштампа
-          F=$(ls -1 romulus/obmc-phosphor-image-romulus.static.mtd 2>/dev/null | head -n1 || true)
-        fi
-        echo "$F"
+        # ищем любой obmc-phosphor-image-romulus*.static.mtd в дереве romulus/
+        find romulus -type f -name 'obmc-phosphor-image-romulus*.static.mtd' | head -n1 || true
       }
 
-      ROM=$(find_rom || true)
+      ROM="$(find_rom || true)"
       if [ -z "${ROM}" ]; then
         curl -L -o romulus.zip \
           "https://jenkins.openbmc.org/job/ci-openbmc/lastSuccessfulBuild/distro=ubuntu,label=docker-builder,target=romulus/artifact/openbmc/build/tmp/deploy/images/romulus/*zip*/romulus.zip"
         rm -rf romulus
         mkdir -p romulus
         unzip -o romulus.zip -d romulus
-        ROM=$(find_rom)
+        ROM="$(find_rom)"
       fi
-      test -f "${ROM}"
 
-      # 2) Проверим, что порты свободны (если заняты — покажем, что их держит)
-      ss -lntup || true
+      if [ -z "${ROM}" ] || [ ! -f "${ROM}" ]; then
+        echo "[ERROR] .mtd image not found after unzip. Tree:"
+        ls -R romulus || true
+        exit 1
+      fi
+      echo "[INFO] Using MTD image: ${ROM}"
+
+      # проверим занятость портов
       for P in ${SSH_PORT} ${HTTPS_PORT}; do
         if ss -lnt | awk '{print $4}' | grep -q ":$P$"; then
           echo "[ERROR] Host port $P already in use"; exit 2
         fi
       done
 
-      # 3) Запускаем QEMU абсолютно теми же флагами, как у тебя на VM
-      #    (hostfwd как в твоей команде; UDP 623 для IPMI оставляем)
+      # запуск qemu — та же команда, что у тебя на VM
       qemu-system-arm -m 256 -M romulus-bmc -nographic \
         -drive file="${ROM}",format=raw,if=mtd \
         -net nic -net user,hostfwd=:0.0.0.0:${SSH_PORT}-:22,hostfwd=:0.0.0.0:${HTTPS_PORT}-:443,hostfwd=udp:0.0.0.0:${IPMI_PORT}-:623,hostname=qemu \
@@ -128,20 +126,16 @@ pipeline {
       echo $! > ../qemu.pid
       cd ..
 
-      # 4) Ожидаем: сперва SSH (признак, что bmc загрузился), затем HTTPS дольше.
+      # ждём SSH до 180с, затем HTTPS до 900с (nc + curl -k)
       wait_tcp() {
         HOST="$1"; PORT="$2"; TIMEOUT="$3"; SECS=0
         echo "[INFO] waiting tcp ${HOST}:${PORT} up to ${TIMEOUT}s ..."
         while ! nc -z "$HOST" "$PORT"; do
           sleep 3; SECS=$((SECS+3))
-          if [ "$SECS" -ge "$TIMEOUT" ]; then
-            echo "[ERROR] Port ${PORT} did not open in time"; return 1
-          fi
+          [ "$SECS" -ge "$TIMEOUT" ] && { echo "[ERROR] Port ${PORT} did not open in time"; return 1; }
         done
-        return 0
       }
 
-      # SSH до 180с, потом HTTPS до 900с (плюс проверка ответов curl -k)
       wait_tcp "${OPENBMC_HOST}" "${SSH_PORT}" 180 || {
         echo '----- QEMU LOG TAIL (SSH wait failed) -----'
         tail -n 200 "${QEMU_LOG}" || true
@@ -168,9 +162,7 @@ pipeline {
     '''
   }
   post {
-    always {
-      archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false
-    }
+    always { archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false }
   }
 }
 
