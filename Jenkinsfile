@@ -1,162 +1,82 @@
 pipeline {
-  agent any
+  agent {
+    docker {
+      image 'python:3.11-slim'     // чистая и стабильная среда
+      reuseNode true
+    }
+  }
 
   options {
     timestamps()
-    // включи строку ниже, если установлен плагин AnsiColor
-    // ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '15'))
+    buildDiscarder(logRotator(numToKeepStr: '20'))
     disableConcurrentBuilds()
   }
 
   environment {
-    SSH_PORT   = '2222'
-    HTTPS_PORT = '2443'
-    IPMI_PORT  = '2623'
-    OPENBMC_HOST = '127.0.0.1'
-    OPENBMC_HTTPS = "https://${OPENBMC_HOST}:${HTTPS_PORT}"
-
-    ART_ROOT  = 'artifacts'
-    QEMU_LOG  = 'artifacts/qemu/qemu.log'
-    ROBOT_OUT = 'artifacts/robot'
-    WEBUI_OUT = 'artifacts/webui'
-    LOAD_OUT  = 'artifacts/load'
-  }
-
-  triggers {
-    // можно выключить, если используешь вебхук
-    pollSCM('H/10 * * * *')
+    REPORTS = 'reports'
+    PIP_CACHE_DIR = '.pip-cache'   // кеш pip в рабочей директории
   }
 
   stages {
     stage('Checkout') {
       steps {
         checkout scm
-        sh 'mkdir -p artifacts/qemu artifacts/robot artifacts/webui artifacts/load'
+        sh 'mkdir -p ${REPORTS} ${PIP_CACHE_DIR}'
       }
     }
 
-    stage('Provision tools') {
+    stage('Setup Python env') {
       steps {
         sh '''
           set -eux
-          sudo apt-get update -o Acquire::Retries=5
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-arm ipmitool curl unzip netcat-openbsd jq \
-            python3 python3-pip python3-venv ca-certificates git \
-            xvfb chromium-driver libnss3 libgconf-2-4
-
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install robotframework robotframework-requests robotframework-sshlibrary robotframework-seleniumlibrary
+          python -V
+          pip install --upgrade pip wheel
+          # базовые инструменты тестов
+          pip install pytest pytest-cov pytest-html
+          # если есть requirements.txt — установим
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # если есть pyproject.toml/setup.cfg/setup.py — поставим сам проект (и тестовые зависимости, если объявлены)
+          if [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -f setup.py ]; then
+            # сначала пробуем extras "test", если объявлены
+            pip install ".[test]" || pip install .
+          fi
         '''
       }
     }
 
-    stage('Start QEMU + OpenBMC') {
+    stage('Run pytest') {
       steps {
+        // Прогон с JUnit, coverage и HTML-отчётом
         sh '''
           set -eux
-          chmod +x ci/scripts/*.sh
-          # стартуем QEMU и ждём пока поднимется HTTPS порт OpenBMC
-          ci/scripts/run_qemu_openbmc.sh "${HTTPS_PORT}" "${SSH_PORT}" "${IPMI_PORT}" >"${QEMU_LOG}" 2>&1 &
-          echo $! > qemu.pid
-          ci/scripts/wait_for_bmc.sh "${OPENBMC_HOST}" "${HTTPS_PORT}" 300
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('API tests (Robot: Redfish/IPMI)') {
-      steps {
-        sh '''
-          set -eux
-          . .venv/bin/activate
-          ci/scripts/run_robot_tests.sh "${OPENBMC_HOST}" "${HTTPS_PORT}" "${ROBOT_OUT}"
+          # если каталог tests/ есть — pytest сам найдёт тесты; иначе укажи путь
+          pytest \
+            -q \
+            --maxfail=1 \
+            --disable-warnings \
+            --junitxml=${REPORTS}/junit.xml \
+            --cov=. \
+            --cov-report=xml:${REPORTS}/coverage.xml \
+            --cov-report=term-missing \
+            --html=${REPORTS}/pytest.html \
+            --self-contained-html
         '''
       }
       post {
         always {
-          archiveArtifacts artifacts: "${ROBOT_OUT}/**", onlyIfSuccessful: false
+          // Публикуем результаты даже при падении тестов
+          junit allowEmptyResults: true, testResults: '${REPORTS}/junit.xml'
+          archiveArtifacts artifacts: '${REPORTS}/**', onlyIfSuccessful: false
           publishHTML(target: [
-            reportDir: "${ROBOT_OUT}",
-            reportFiles: 'report.html,log.html',
-            reportName: 'Robot API Tests',
+            reportDir: "${REPORTS}",
+            reportFiles: 'pytest.html',
+            reportName: 'PyTest Report',
             keepAll: true,
             alwaysLinkToLastBuild: true
           ])
         }
-      }
-    }
-
-    stage('WebUI tests (Robot + Selenium)') {
-      steps {
-        sh '''
-          set -eux
-          . .venv/bin/activate
-          ci/scripts/run_webui_tests.sh "${OPENBMC_HOST}" "${HTTPS_PORT}" "${WEBUI_OUT}"
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${WEBUI_OUT}/**", onlyIfSuccessful: false
-          publishHTML(target: [
-            reportDir: "${WEBUI_OUT}",
-            reportFiles: 'report.html,log.html',
-            reportName: 'Robot WebUI Tests',
-            keepAll: true,
-            alwaysLinkToLastBuild: true
-          ])
-        }
-      }
-    }
-
-    stage('Load testing') {
-      steps {
-        sh 'ci/scripts/run_load_test.sh "${OPENBMC_HTTPS}" "${LOAD_OUT}"'
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: "${LOAD_OUT}/**", onlyIfSuccessful: false
-        }
-      }
-    }
-
-    stage('Collect evidence (obmcutil & ipmitool)') {
-      steps {
-        sh '''
-          set -eux
-          # 1) состояние сервисов на самом BMC
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -p "${SSH_PORT}" root@${OPENBMC_HOST} 'obmcutil state' \
-              | tee artifacts/qemu/obmcutil_state.txt || true
-
-          # 2) FRU через IPMI c хоста
-          ipmitool -I lanplus -H ${OPENBMC_HOST} -p ${IPMI_PORT} -U root -P 0penBmc fru print \
-              | tee artifacts/qemu/ipmi_fru_print.txt || true
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'artifacts/qemu/obmcutil_state.txt,artifacts/qemu/ipmi_fru_print.txt', onlyIfSuccessful: false
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      script {
-        sh '''
-          set +e
-          if [ -f qemu.pid ]; then kill -9 "$(cat qemu.pid)" || true; fi
-          pkill -f qemu-system-arm || true
-        '''
       }
     }
   }
